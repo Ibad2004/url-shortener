@@ -2,9 +2,21 @@
 
 export const MAX_URL_LENGTH = 2048;
 
+export const EXPIRY_MS = {
+  "1h": 60 * 60 * 1000,
+  "1d": 24 * 60 * 60 * 1000,
+  "7d": 7 * 24 * 60 * 60 * 1000,
+  "30d": 30 * 24 * 60 * 60 * 1000,
+} as const;
+export type ExpiresIn = keyof typeof EXPIRY_MS;
+
 export function createLinkSchema(baseUrl: string) {
   const ownHost = new URL(baseUrl).host.toLowerCase();
   return z.object({
+    expiresIn: z
+      .enum(["1h", "1d", "7d", "30d"], { error: "expiresIn must be one of 1h, 1d, 7d, 30d or null" })
+      .nullable()
+      .optional(),
     url: z
       .string({ error: "url is required and must be a string" })
       .trim()
@@ -28,3 +40,4 @@ export function createLinkSchema(baseUrl: string) {
       }),
   });
 }
+

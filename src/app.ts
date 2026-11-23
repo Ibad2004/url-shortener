@@ -4,12 +4,14 @@ import { normalizeBaseUrl } from "./config.js";
 import { HttpError } from "./errors.js";
 import { Link } from "./link.model.js";
 import { errorHandler, logger, notFound } from "./middleware.js";
-import { createLinkSchema } from "./schemas.js";
+import { EXPIRY_MS, createLinkSchema } from "./schemas.js";
+import cors from "cors";
 
 export interface AppOptions {
   baseUrl?: string;
   generateCode?: CodeGenerator;
   logRequests?: boolean;
+  corsOrigins?: string[];
 }
 
 const MAX_CODE_TRIES = 5;
@@ -22,6 +24,11 @@ function paramCode(req: Request): string {
   const value = req.params.code;
   return typeof value === "string" ? value : "";
 }
+
+const EXPIRED_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Link expired</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="font-family:sans-serif;text-align:center;margin-top:20vh"><h1>This link has expired</h1>
+<p>Ask the person who shared it for a new one.</p></body></html>`;
 
 function wantsHtml(req: Request): boolean {
   return (req.get("accept") ?? "").includes("text/html");
@@ -37,15 +44,19 @@ export function createApp(options: AppOptions = {}): Express {
   const generate = options.generateCode ?? defaultGenerator;
   const createSchema = createLinkSchema(baseUrl);
 
-  const present = (link: { code: string; url: string; clicks: number; createdAt: Date }) => ({
+  const present = (link: { code: string; url: string; clicks: number; createdAt: Date; expiresAt?: Date | null }) => ({
     code: link.code,
     shortUrl: `${baseUrl}/${link.code}`,
     url: link.url,
     clicks: link.clicks,
     createdAt: link.createdAt,
+    expiresAt: link.expiresAt ?? null,
+    expired: link.expiresAt != null && link.expiresAt.getTime() <= Date.now(),
   });
 
+  const origins = options.corsOrigins ?? (process.env.CORS_ORIGINS ?? "http://localhost:5174").split(",").map((o) => o.trim()).filter(Boolean);
   const app = express();
+  app.use(cors({ origin: origins, allowedHeaders: ["Content-Type"], credentials: false }));
   if (options.logRequests ?? process.env.NODE_ENV !== "test") app.use(logger);
   app.use(express.json({ limit: "10kb" }));
 
@@ -59,9 +70,11 @@ export function createApp(options: AppOptions = {}): Express {
       if (!parsed.success) {
         throw new HttpError(400, parsed.error.issues[0]?.message ?? "Invalid request");
       }
+      const { expiresIn } = parsed.data;
+      const expiresAt = expiresIn ? new Date(Date.now() + EXPIRY_MS[expiresIn]) : null;
       for (let attempt = 0; attempt < MAX_CODE_TRIES; attempt++) {
         try {
-          const link = await Link.create({ code: generate(), url: parsed.data.url });
+          const link = await Link.create({ code: generate(), url: parsed.data.url, expiresAt });
           res.status(201).json(present(link));
           return;
         } catch (err) {
@@ -89,12 +102,22 @@ export function createApp(options: AppOptions = {}): Express {
     try {
       const code = paramCode(req);
       let link = null;
+      let expired = false;
       if (CODE_PATTERN.test(code)) {
+        const live = { code, $or: [{ expiresAt: null }, { expiresAt: { $gt: new Date() } }] };
         // HEAD must not count a click; GET increments atomically in one operation.
         link =
           req.method === "HEAD"
-            ? await Link.findOne({ code })
-            : await Link.findOneAndUpdate({ code }, { $inc: { clicks: 1 } });
+            ? await Link.findOne(live)
+            : await Link.findOneAndUpdate(live, { $inc: { clicks: 1 } });
+        if (!link) expired = (await Link.exists({ code })) !== null;
+      }
+      if (!link && expired) {
+        if (wantsHtml(req)) {
+          res.status(410).type("html").send(EXPIRED_PAGE);
+          return;
+        }
+        throw new HttpError(410, "This link has expired");
       }
       if (!link) {
         if (wantsHtml(req)) {
@@ -114,4 +137,5 @@ export function createApp(options: AppOptions = {}): Express {
   app.use(errorHandler);
   return app;
 }
+
 
